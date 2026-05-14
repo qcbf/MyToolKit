@@ -1,0 +1,5 @@
+/* resource.rc — MinGW-w64 only (MSVC uses pragma linker instead) */
+#include <windows.h>
+
+/* Embed app.manifest as RT_MANIFEST resource */
+1 RT_MANIFEST "app.manifest"
