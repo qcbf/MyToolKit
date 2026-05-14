@@ -211,8 +211,14 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 static void ShowEscOverlay(void)
 {
-    int x = (GetSystemMetrics(SM_CXSCREEN) - OV_W) / 2;
-    int y = (GetSystemMetrics(SM_CYSCREEN) - OV_H) / 2;
+    /* Center on the monitor that contains the current foreground window. */
+    HWND hFg = GetForegroundWindow();
+    HMONITOR hMon = MonitorFromWindow(hFg ? hFg : s_hwndMain, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi;
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfo(hMon, &mi);
+    int x = mi.rcMonitor.left + (mi.rcMonitor.right  - mi.rcMonitor.left - OV_W) / 2;
+    int y = mi.rcMonitor.top  + (mi.rcMonitor.bottom - mi.rcMonitor.top  - OV_H) / 2;
 
     s_hwndOverlay = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
