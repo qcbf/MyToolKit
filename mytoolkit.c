@@ -4,6 +4,7 @@
  *   1. CapsRemap  — CapsLock -> Ctrl+Space
  *   2. EscClose   — Hold ESC 1.0s -> Alt+F4, with on-screen countdown overlay
  *                   (200ms activation delay; short taps pass through unchanged)
+ *   3. WinBacktick — Win+` cycles windows of the same app (like macOS Cmd+`)
  *
  * Build (MSVC):    build_msvc.bat
  * Build (MinGW):   windres resource.rc -o resource.o
@@ -23,6 +24,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
+#include <stdlib.h>
 
 /* ── Message / timer IDs ── */
 #define IDI_APP              1
@@ -36,6 +38,8 @@
 #define TIMER_ESC_DELAY      1    /* 200ms one-shot: ignores short taps        */
 #define TIMER_ESC_TICK       2    /* 30ms recurring: drives progress animation */
 #define TIMER_CAPS           3    /* one-shot: CapsLock long-press threshold   */
+
+#define HOTKEY_WIN_BACKTICK  1    /* RegisterHotKey ID for Win+`               */
 
 #define ESC_DELAY_MS         200  /* ms before overlay activates               */
 #define ESC_HOLD_MS          1000 /* ms of hold required to fire Alt+F4        */
@@ -355,6 +359,75 @@ static void ToggleStartup(void)
 
 
 /* ════════════════════════════════════════════════════════════════
+ *  Feature 3: WinBacktick — Win+` cycles windows of the same app
+ *  Enumerates all visible top-level windows belonging to the same
+ *  process as the foreground window, then activates the next one.
+ * ════════════════════════════════════════════════════════════════ */
+typedef struct {
+    DWORD  pid;
+    HWND*  list;
+    int    count;
+    int    capacity;
+} EnumSameAppCtx;
+
+static BOOL CALLBACK EnumSameAppProc(HWND hwnd, LPARAM lParam)
+{
+    EnumSameAppCtx* ctx = (EnumSameAppCtx*)lParam;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != ctx->pid) return TRUE;
+
+    /* Only consider visible, non-minimized, non-tool, non-child top-level windows */
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
+    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
+    if (style & WS_CHILD) return TRUE;
+
+    /* Must have a non-empty title (filters out hidden helper windows) */
+    if (GetWindowTextLengthW(hwnd) == 0) return TRUE;
+
+    if (ctx->count >= ctx->capacity)
+    {
+        ctx->capacity = ctx->capacity ? ctx->capacity * 2 : 16;
+        ctx->list = (HWND*)realloc(ctx->list, ctx->capacity * sizeof(HWND));
+    }
+    ctx->list[ctx->count++] = hwnd;
+    return TRUE;
+}
+
+static void SwitchToNextAppWindow(void)
+{
+    HWND fgWnd = GetForegroundWindow();
+    if (!fgWnd) return;
+
+    DWORD fgPid = 0;
+    GetWindowThreadProcessId(fgWnd, &fgPid);
+    if (!fgPid) return;
+
+    EnumSameAppCtx ctx = { fgPid, NULL, 0, 0 };
+    EnumWindows(EnumSameAppProc, (LPARAM)&ctx);
+
+    if (ctx.count < 2) { free(ctx.list); return; }
+
+    /* Find current window in list and pick the next one */
+    int idx = -1;
+    for (int i = 0; i < ctx.count; i++)
+    {
+        if (ctx.list[i] == fgWnd) { idx = i; break; }
+    }
+
+    HWND target = ctx.list[(idx + 1) % ctx.count];
+
+    /* Activate the target window */
+    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
+    SetForegroundWindow(target);
+
+    free(ctx.list);
+}
+
+
+/* ════════════════════════════════════════════════════════════════
  *  Tray icon & context menu
  * ════════════════════════════════════════════════════════════════ */
 static void ShowTrayMenu(HWND hwnd)
@@ -391,6 +464,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         else if (LOWORD(wParam) == ID_MENU_ABOUT)
             ShellExecuteW(NULL, L"open", L"https://github.com/qcbf/MyToolKit", NULL, NULL, SW_SHOWNORMAL);
         else if (LOWORD(wParam) == ID_MENU_EXIT) DestroyWindow(hwnd);
+        return 0;
+
+    /* ── Win+` hotkey ── */
+    case WM_HOTKEY:
+        if (wParam == HOTKEY_WIN_BACKTICK) SwitchToNextAppWindow();
         return 0;
 
     /* ── CapsRemap/Toggle: CapsLock pressed ──
@@ -497,6 +575,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_DESTROY:
+        UnregisterHotKey(hwnd, HOTKEY_WIN_BACKTICK);
         KillTimer(hwnd, TIMER_CAPS);
         KillTimer(hwnd, TIMER_ESC_DELAY);
         KillTimer(hwnd, TIMER_ESC_TICK);
@@ -560,6 +639,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 
     /* ── Keyboard hook (CapsRemap + EscClose) ── */
     s_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, OnKeyboardEvent, NULL, 0);
+
+    /* ── Win+` hotkey (WinBacktick: cycle same-app windows) ── */
+    RegisterHotKey(s_hwndMain, HOTKEY_WIN_BACKTICK, MOD_WIN | MOD_NOREPEAT, VK_OEM_3);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
     {
