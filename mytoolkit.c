@@ -1,21 +1,21 @@
 /*
  * MyToolKit.exe
- * A lightweight Win32 toolkit. Features:
- *   - CapsRemap: CapsLock -> Ctrl+Space
- *   - System tray icon with right-click menu
+ * Lightweight Win32 toolkit. Features:
+ *   1. CapsRemap  — CapsLock -> Ctrl+Space
+ *   2. EscClose   — Hold ESC 1.0s -> Alt+F4, with on-screen countdown overlay
+ *                   (200ms activation delay; short taps pass through unchanged)
  *
- * Build (MSVC):
- *   build_msvc.bat
- *
- * Build (MinGW-w64):
- *   windres resource.rc -o resource.o
- *   gcc -O2 -s -mwindows mytoolkit.c resource.o -o mytoolkit.exe -luser32 -lshell32 -ladvapi32
+ * Build (MSVC):    build_msvc.bat
+ * Build (MinGW):   windres resource.rc -o resource.o
+ *                  gcc -O2 -s -mwindows mytoolkit.c resource.o -o mytoolkit.exe
+ *                       -luser32 -lshell32 -ladvapi32 -lgdi32
  */
 
 #ifdef _MSC_VER
 #   pragma comment(lib, "user32.lib")
 #   pragma comment(lib, "shell32.lib")
 #   pragma comment(lib, "advapi32.lib")
+#   pragma comment(lib, "gdi32.lib")
 #   pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #endif
 
@@ -24,68 +24,223 @@
 #include <windows.h>
 #include <shellapi.h>
 
-/* ── Resource / message IDs ── */
-#define IDI_APP          1
-#define WM_TRAY_MSG      (WM_APP + 1)
-#define ID_MENU_STARTUP  100
-#define ID_MENU_EXIT     101
+/* ── Message / timer IDs ── */
+#define IDI_APP              1
 
-#define TASK_NAME   L"MyToolKit"
-#define MUTEX_NAME  L"Global\\MyToolKit_SingleInstance"
-#define WND_CLASS   L"MyToolKit_TrayWnd"
+#define WM_TRAY_MSG          (WM_APP + 1)
+#define WM_ESC_DOWN          (WM_APP + 2)
+#define WM_ESC_UP            (WM_APP + 3)
+#define WM_CAPS_DOWN         (WM_APP + 4)
+#define WM_CAPS_UP           (WM_APP + 5)
 
+#define TIMER_ESC_DELAY      1    /* 200ms one-shot: ignores short taps        */
+#define TIMER_ESC_TICK       2    /* 30ms recurring: drives progress animation */
+#define TIMER_CAPS           3    /* one-shot: CapsLock long-press threshold   */
+
+#define ESC_DELAY_MS         200  /* ms before overlay activates               */
+#define ESC_HOLD_MS          1000 /* ms of hold required to fire Alt+F4        */
+#define ESC_TICK_MS          30   /* repaint interval (ms)                     */
+#define CAPS_HOLD_MS         400  /* ms to distinguish tap vs. long-press      */
+
+/* ── Overlay geometry ── */
+#define OV_W                 260
+#define OV_H                 44
+#define OV_PAD               14   /* horizontal margin */
+#define OV_BAR_Y             32   /* bar top y         */
+#define OV_BAR_H             6    /* bar height        */
+
+/* ── Tray menu IDs ── */
+#define ID_MENU_STARTUP      100
+#define ID_MENU_EXIT         101
+
+#define TASK_NAME            L"MyToolKit"
+#define MUTEX_NAME           L"Global\\MyToolKit_SingleInstance"
+#define WND_CLASS_MAIN       L"MyToolKit_TrayWnd"
+#define WND_CLASS_OVERLAY    L"MyToolKit_OverlayWnd"
+
+/* ── Globals ── */
 static HHOOK           s_kbHook;
 static HINSTANCE       s_hInst;
 static NOTIFYICONDATAW s_nid;
+static HWND            s_hwndMain;
+static HWND            s_hwndOverlay;
+static BOOL            s_escDown;      /* ESC physically held      */
+static BOOL            s_escActive;    /* countdown phase running  */
+static int             s_escElapsedMs; /* ms elapsed in countdown  */
+static BOOL            s_capsDown;     /* CapsLock physically held */
 
-/* ════════════════════════════════════════════
- *  Feature: CapsRemap
- *  CapsLock -> Ctrl+Space (low-level keyboard hook)
- * ════════════════════════════════════════════ */
+
+/* ════════════════════════════════════════════════════════════════
+ *  Feature 1: CapsRemap  (CapsLock -> Ctrl+Space)
+ *  Feature 2: EscClose   (ESC held -> Alt+F4)
+ * ════════════════════════════════════════════════════════════════ */
 static LRESULT CALLBACK OnKeyboardEvent(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code == HC_ACTION)
     {
         const KBDLLHOOKSTRUCT* kb = (const KBDLLHOOKSTRUCT*)lParam;
 
-        /*
-         * Only intercept real CapsLock (skip injected/synthetic keystrokes
-         * to prevent feedback loops with our own SendInput).
-         */
-        if (kb->vkCode == VK_CAPITAL && !(kb->flags & LLKHF_INJECTED))
+        if (!(kb->flags & LLKHF_INJECTED))
         {
-            if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+            /* ── CapsRemap / CapsToggle ──
+             *   Tap  (<400ms): Ctrl+Space  (input method switch)
+             *   Hold (>=400ms): real CapsLock toggle (macOS style)
+             *   All non-injected CapsLock events are suppressed here;
+             *   the actual actions are fired from WndProc timers.     */
+            if (kb->vkCode == VK_CAPITAL)
             {
-                INPUT seq[4];
-                ZeroMemory(seq, sizeof(seq));
-
-                seq[0].type       = INPUT_KEYBOARD;
-                seq[0].ki.wVk     = VK_LCONTROL;
-
-                seq[1].type       = INPUT_KEYBOARD;
-                seq[1].ki.wVk     = VK_SPACE;
-
-                seq[2].type       = INPUT_KEYBOARD;
-                seq[2].ki.wVk     = VK_SPACE;
-                seq[2].ki.dwFlags = KEYEVENTF_KEYUP;
-
-                seq[3].type       = INPUT_KEYBOARD;
-                seq[3].ki.wVk     = VK_LCONTROL;
-                seq[3].ki.dwFlags = KEYEVENTF_KEYUP;
-
-                SendInput(4, seq, sizeof(INPUT));
+                if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && !s_capsDown)
+                {
+                    s_capsDown = TRUE;
+                    PostMessageW(s_hwndMain, WM_CAPS_DOWN, 0, 0);
+                }
+                else if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) && s_capsDown)
+                {
+                    s_capsDown = FALSE;
+                    PostMessageW(s_hwndMain, WM_CAPS_UP, 0, 0);
+                }
+                return 1; /* always suppress physical CapsLock */
             }
 
-            /* Suppress original CapsLock: no LED toggle, no caps-state change. */
-            return 1;
+            /* ── EscClose: track first down / up only ── */
+            if (kb->vkCode == VK_ESCAPE)
+            {
+                if ((wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) && !s_escDown)
+                {
+                    s_escDown = TRUE;
+                    PostMessageW(s_hwndMain, WM_ESC_DOWN, 0, 0);
+                }
+                else if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) && s_escDown)
+                {
+                    s_escDown = FALSE;
+                    PostMessageW(s_hwndMain, WM_ESC_UP, 0, 0);
+                }
+                /* ESC always passes through so apps receive it normally. */
+            }
         }
     }
     return CallNextHookEx(s_kbHook, code, wParam, lParam);
 }
 
-/* ════════════════════════════════════════════
+
+/* ════════════════════════════════════════════════════════════════
+ *  ESC countdown overlay (subtle, low-profile)
+ * ════════════════════════════════════════════════════════════════ */
+static BYTE LerpByte(BYTE a, BYTE b, float t)
+{
+    return (BYTE)(a + (int)((b - a) * t));
+}
+
+static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+        /* Double-buffer */
+        HDC     memDC  = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, OV_W, OV_H);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+
+        /* Background */
+        RECT rc = { 0, 0, OV_W, OV_H };
+        HBRUSH bgBrush = CreateSolidBrush(RGB(36, 36, 36));
+        FillRect(memDC, &rc, bgBrush);
+        DeleteObject(bgBrush);
+
+        /* Bar track */
+        RECT trackRc = { OV_PAD, OV_BAR_Y, OV_W - OV_PAD, OV_BAR_Y + OV_BAR_H };
+        HBRUSH trackBrush = CreateSolidBrush(RGB(62, 62, 62));
+        FillRect(memDC, &trackRc, trackBrush);
+        DeleteObject(trackBrush);
+
+        /* Bar fill — muted teal -> amber */
+        float progress = (float)s_escElapsedMs / (float)ESC_HOLD_MS;
+        if (progress < 0.0f) progress = 0.0f;
+        if (progress > 1.0f) progress = 1.0f;
+
+        int fillW = (int)((OV_W - OV_PAD * 2) * progress);
+        if (fillW > 0)
+        {
+            BYTE r = LerpByte(70,  200, progress);
+            BYTE g = LerpByte(150, 70,  progress);
+            BYTE b = LerpByte(120, 50,  progress);
+            HBRUSH fillBrush = CreateSolidBrush(RGB(r, g, b));
+            RECT fillRc = { OV_PAD, OV_BAR_Y, OV_PAD + fillW, OV_BAR_Y + OV_BAR_H };
+            FillRect(memDC, &fillRc, fillBrush);
+            DeleteObject(fillBrush);
+        }
+
+        /* Text */
+        int remainSec = (ESC_HOLD_MS - s_escElapsedMs + 999) / 1000;
+        if (remainSec < 1) remainSec = 1;
+        WCHAR text[32];
+        wsprintfW(text, L"Hold ESC · %ds", remainSec);
+
+        HFONT hFont = CreateFontW(
+            14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT oldFont = (HFONT)SelectObject(memDC, hFont);
+
+        SetBkMode(memDC, TRANSPARENT);
+        SetTextColor(memDC, RGB(170, 170, 170));
+        RECT textRc = { OV_PAD, 8, OV_W - OV_PAD, OV_BAR_Y - 2 };
+        DrawTextW(memDC, text, -1, &textRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(memDC, oldFont);
+        DeleteObject(hFont);
+
+        BitBlt(hdc, 0, 0, OV_W, OV_H, memDC, 0, 0, SRCCOPY);
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowEscOverlay(void)
+{
+    int x = (GetSystemMetrics(SM_CXSCREEN) - OV_W) / 2;
+    int y = (GetSystemMetrics(SM_CYSCREEN) - OV_H) / 2;
+
+    s_hwndOverlay = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        WND_CLASS_OVERLAY, NULL, WS_POPUP,
+        x, y, OV_W, OV_H,
+        NULL, NULL, s_hInst, NULL);
+
+    if (s_hwndOverlay)
+    {
+        SetLayeredWindowAttributes(s_hwndOverlay, 0, 148, LWA_ALPHA); /* ~58% opacity */
+        ShowWindow(s_hwndOverlay, SW_SHOWNOACTIVATE);
+        UpdateWindow(s_hwndOverlay);
+    }
+}
+
+static void HideEscOverlay(void)
+{
+    if (s_hwndOverlay)
+    {
+        DestroyWindow(s_hwndOverlay);
+        s_hwndOverlay = NULL;
+    }
+}
+
+
+/* ════════════════════════════════════════════════════════════════
  *  Elevation helpers
- * ════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════════ */
 static BOOL IsRunningElevated(void)
 {
     BOOL elevated = FALSE;
@@ -105,9 +260,7 @@ static void EnsureElevated(void)
 {
     WCHAR exePath[MAX_PATH];
     SHELLEXECUTEINFOW sei;
-
     if (IsRunningElevated()) return;
-
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
     ZeroMemory(&sei, sizeof(sei));
     sei.cbSize = sizeof(sei);
@@ -118,9 +271,10 @@ static void EnsureElevated(void)
     ExitProcess(0);
 }
 
-/* ════════════════════════════════════════════
+
+/* ════════════════════════════════════════════════════════════════
  *  Single-instance guard
- * ════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════════ */
 static BOOL IsAlreadyRunning(void)
 {
     static HANDLE s_hMutex = NULL;
@@ -136,11 +290,10 @@ static BOOL IsAlreadyRunning(void)
     return FALSE;
 }
 
-/* ════════════════════════════════════════════
- *  Auto-start (Task Scheduler)
- * ════════════════════════════════════════════ */
 
-/* Run `cmd.exe /c <cmdLine>` silently; return process exit code. */
+/* ════════════════════════════════════════════════════════════════
+ *  Auto-start (Task Scheduler)
+ * ════════════════════════════════════════════════════════════════ */
 static DWORD RunCmd(LPCWSTR cmdLine)
 {
     WCHAR buf[1024];
@@ -149,8 +302,7 @@ static DWORD RunCmd(LPCWSTR cmdLine)
     DWORD exitCode = 1;
 
     wsprintfW(buf, L"/c %s", cmdLine);
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
+    ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
     if (CreateProcessW(L"C:\\Windows\\System32\\cmd.exe", buf,
@@ -194,24 +346,21 @@ static void ToggleStartup(void)
     }
 }
 
-/* ════════════════════════════════════════════
+
+/* ════════════════════════════════════════════════════════════════
  *  Tray icon & context menu
- * ════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════════ */
 static void ShowTrayMenu(HWND hwnd)
 {
     HMENU hMenu = CreatePopupMenu();
-    BOOL  startupOn = IsStartupEnabled();
-
     AppendMenuW(hMenu,
-                MF_STRING | (startupOn ? MF_CHECKED : MF_UNCHECKED),
+                MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED),
                 ID_MENU_STARTUP, L"开机启动");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_MENU_EXIT, L"退出");
 
     POINT pt;
     GetCursorPos(&pt);
-
-    /* Required so the menu dismisses when clicking elsewhere. */
     SetForegroundWindow(hwnd);
     TrackPopupMenuEx(hMenu,
                      TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RIGHTALIGN,
@@ -223,24 +372,124 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg)
     {
+    /* ── Tray ── */
     case WM_TRAY_MSG:
-        if (lParam == WM_RBUTTONUP)
-            ShowTrayMenu(hwnd);
+        if (lParam == WM_RBUTTONUP) ShowTrayMenu(hwnd);
         return 0;
 
     case WM_COMMAND:
-        switch (LOWORD(wParam))
+        if (LOWORD(wParam) == ID_MENU_STARTUP) ToggleStartup();
+        else if (LOWORD(wParam) == ID_MENU_EXIT) DestroyWindow(hwnd);
+        return 0;
+
+    /* ── CapsRemap/Toggle: CapsLock pressed ──
+     *   Start threshold timer. Fire on release or expiry.          */
+    case WM_CAPS_DOWN:
+        SetTimer(hwnd, TIMER_CAPS, CAPS_HOLD_MS, NULL);
+        return 0;
+
+    /* ── CapsLock released ── */
+    case WM_CAPS_UP:
+        if (KillTimer(hwnd, TIMER_CAPS))
         {
-        case ID_MENU_STARTUP:
-            ToggleStartup();
-            break;
-        case ID_MENU_EXIT:
-            DestroyWindow(hwnd);
-            break;
+            /* Released before threshold → short tap → Ctrl+Space */
+            INPUT seq[4];
+            ZeroMemory(seq, sizeof(seq));
+            seq[0].type       = INPUT_KEYBOARD; seq[0].ki.wVk     = VK_LCONTROL;
+            seq[1].type       = INPUT_KEYBOARD; seq[1].ki.wVk     = VK_SPACE;
+            seq[2].type       = INPUT_KEYBOARD; seq[2].ki.wVk     = VK_SPACE;
+            seq[2].ki.dwFlags = KEYEVENTF_KEYUP;
+            seq[3].type       = INPUT_KEYBOARD; seq[3].ki.wVk     = VK_LCONTROL;
+            seq[3].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(4, seq, sizeof(INPUT));
+        }
+        /* If KillTimer returns FALSE the timer already fired (long press handled there). */
+        return 0;
+
+    /* ── EscClose: ESC physically pressed ──
+     *   Start 200ms delay timer. If released before it fires,
+     *   the keystroke passes through untouched (normal ESC).      */
+    case WM_ESC_DOWN:
+        SetTimer(hwnd, TIMER_ESC_DELAY, ESC_DELAY_MS, NULL);
+        return 0;
+
+    /* ── EscClose: ESC released ── */
+    case WM_ESC_UP:
+        if (s_escActive)
+        {
+            /* Cancel active countdown */
+            KillTimer(hwnd, TIMER_ESC_TICK);
+            s_escActive = FALSE;
+            HideEscOverlay();
+        }
+        else
+        {
+            /* Released during delay window — just cancel the delay timer */
+            KillTimer(hwnd, TIMER_ESC_DELAY);
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == TIMER_CAPS)
+        {
+            /* Long press threshold reached → toggle real CapsLock.
+             * Send injected VK_CAPITAL so it bypasses our hook filter
+             * and reaches the system (toggles LED + caps state).      */
+            INPUT cap[2];
+            ZeroMemory(cap, sizeof(cap));
+            cap[0].type   = INPUT_KEYBOARD;
+            cap[0].ki.wVk = VK_CAPITAL;
+            cap[1].type   = INPUT_KEYBOARD;
+            cap[1].ki.wVk = VK_CAPITAL;
+            cap[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            SendInput(2, cap, sizeof(INPUT));
+        }
+        else if (wParam == TIMER_ESC_DELAY)
+        {
+            /* Delay elapsed and ESC still held — activate countdown */
+            KillTimer(hwnd, TIMER_ESC_DELAY);
+            if (s_escDown)
+            {
+                s_escActive    = TRUE;
+                s_escElapsedMs = 0;
+                ShowEscOverlay();
+                SetTimer(hwnd, TIMER_ESC_TICK, ESC_TICK_MS, NULL);
+            }
+        }
+        else if (wParam == TIMER_ESC_TICK)
+        {
+            s_escElapsedMs += ESC_TICK_MS;
+
+            if (s_escElapsedMs >= ESC_HOLD_MS)
+            {
+                /* Threshold reached — fire Alt+F4 */
+                KillTimer(hwnd, TIMER_ESC_TICK);
+                s_escActive = FALSE;
+                s_escDown   = FALSE;
+                HideEscOverlay();
+
+                INPUT seq[4];
+                ZeroMemory(seq, sizeof(seq));
+                seq[0].type       = INPUT_KEYBOARD; seq[0].ki.wVk     = VK_MENU;
+                seq[1].type       = INPUT_KEYBOARD; seq[1].ki.wVk     = VK_F4;
+                seq[2].type       = INPUT_KEYBOARD; seq[2].ki.wVk     = VK_F4;
+                seq[2].ki.dwFlags = KEYEVENTF_KEYUP;
+                seq[3].type       = INPUT_KEYBOARD; seq[3].ki.wVk     = VK_MENU;
+                seq[3].ki.dwFlags = KEYEVENTF_KEYUP;
+                SendInput(4, seq, sizeof(INPUT));
+            }
+            else if (s_hwndOverlay)
+            {
+                InvalidateRect(s_hwndOverlay, NULL, FALSE);
+            }
         }
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, TIMER_CAPS);
+        KillTimer(hwnd, TIMER_ESC_DELAY);
+        KillTimer(hwnd, TIMER_ESC_TICK);
+        HideEscOverlay();
         Shell_NotifyIconW(NIM_DELETE, &s_nid);
         PostQuitMessage(0);
         return 0;
@@ -248,14 +497,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-/* ════════════════════════════════════════════
+
+/* ════════════════════════════════════════════════════════════════
  *  Entry point
- * ════════════════════════════════════════════ */
+ * ════════════════════════════════════════════════════════════════ */
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 {
     WNDCLASSEXW wc;
-    HWND        hwnd;
-    HICON       hIcon;
     MSG         msg;
 
     (void)hPrev; (void)lpCmd; (void)nShow;
@@ -264,26 +512,34 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     EnsureElevated();
     if (IsAlreadyRunning()) return 1;
 
-    /* Register hidden message-only window class */
+    /* ── Main (message-only) window ── */
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
-    wc.lpszClassName = WND_CLASS;
+    wc.lpszClassName = WND_CLASS_MAIN;
     RegisterClassExW(&wc);
 
-    hwnd = CreateWindowExW(0, WND_CLASS, NULL, 0,
-                           0, 0, 0, 0,
-                           HWND_MESSAGE, NULL, hInst, NULL);
+    s_hwndMain = CreateWindowExW(0, WND_CLASS_MAIN, NULL, 0,
+                                 0, 0, 0, 0,
+                                 HWND_MESSAGE, NULL, hInst, NULL);
+
+    /* ── Overlay window class ── */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = OverlayWndProc;
+    wc.hInstance     = hInst;
+    wc.lpszClassName = WND_CLASS_OVERLAY;
+    RegisterClassExW(&wc);
 
     /* ── Tray icon ── */
-    hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP));
+    HICON hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP));
     if (!hIcon)
-        hIcon = LoadIconW(NULL, IDI_APPLICATION);
+        hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512)); /* IDI_APPLICATION */
 
     ZeroMemory(&s_nid, sizeof(s_nid));
     s_nid.cbSize           = sizeof(s_nid);
-    s_nid.hWnd             = hwnd;
+    s_nid.hWnd             = s_hwndMain;
     s_nid.uID              = 1;
     s_nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
     s_nid.uCallbackMessage = WM_TRAY_MSG;
@@ -291,7 +547,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     lstrcpyW(s_nid.szTip, L"MyToolKit");
     Shell_NotifyIconW(NIM_ADD, &s_nid);
 
-    /* ── CapsRemap keyboard hook ── */
+    /* ── Keyboard hook (CapsRemap + EscClose) ── */
     s_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, OnKeyboardEvent, NULL, 0);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0)

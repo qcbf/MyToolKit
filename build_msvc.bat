@@ -11,7 +11,7 @@ echo [BUILD] Compiling mytoolkit.c (MSVC, size-optimized) ...
 cl /nologo /O1 /Os /GS- /W3 /utf-8 ^
    mytoolkit.c resource.res ^
    /link /OPT:REF /OPT:ICF ^
-   user32.lib shell32.lib advapi32.lib ^
+   user32.lib shell32.lib advapi32.lib gdi32.lib ^
    /OUT:mytoolkit.exe
 
 if %errorlevel%==0 (
