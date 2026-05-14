@@ -52,6 +52,7 @@
 /* ── Tray menu IDs ── */
 #define ID_MENU_STARTUP      100
 #define ID_MENU_EXIT         101
+#define ID_MENU_ABOUT        102
 
 #define TASK_NAME            L"MyToolKit"
 #define MUTEX_NAME           L"Global\\MyToolKit_SingleInstance"
@@ -363,6 +364,8 @@ static void ShowTrayMenu(HWND hwnd)
                 MF_STRING | (IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED),
                 ID_MENU_STARTUP, L"开机启动");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, ID_MENU_ABOUT, L"About");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, ID_MENU_EXIT, L"退出");
 
     POINT pt;
@@ -385,6 +388,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
     case WM_COMMAND:
         if (LOWORD(wParam) == ID_MENU_STARTUP) ToggleStartup();
+        else if (LOWORD(wParam) == ID_MENU_ABOUT)
+            ShellExecuteW(NULL, L"open", L"https://github.com/qcbf/MyToolKit", NULL, NULL, SW_SHOWNORMAL);
         else if (LOWORD(wParam) == ID_MENU_EXIT) DestroyWindow(hwnd);
         return 0;
 
