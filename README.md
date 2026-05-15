@@ -78,3 +78,8 @@ Win+` 按下
        ├─ EnumWindows 枚举同进程可见窗口
        └─ SetForegroundWindow 切换到下一个
 ```
+
+### 友情链接
+linux.do —— 真诚、友善、团结、专业，共建你我引以为荣之社区。
+
+
