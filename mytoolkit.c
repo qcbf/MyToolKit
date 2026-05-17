@@ -73,6 +73,7 @@ static BOOL            s_escDown;      /* ESC physically held      */
 static BOOL            s_escActive;    /* countdown phase running  */
 static int             s_escElapsedMs; /* ms elapsed in countdown  */
 static BOOL            s_capsDown;     /* CapsLock physically held */
+static UINT            s_wmTaskbarCreated; /* "TaskbarCreated" msg ID */
 
 
 /* ════════════════════════════════════════════════════════════════
@@ -583,6 +584,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         Shell_NotifyIconW(NIM_DELETE, &s_nid);
         PostQuitMessage(0);
         return 0;
+
+    default:
+        /* Explorer 重启后会广播 TaskbarCreated，需要重新添加托盘图标 */
+        if (msg == s_wmTaskbarCreated && s_wmTaskbarCreated != 0)
+        {
+            Shell_NotifyIconW(NIM_ADD, &s_nid);
+            return 0;
+        }
+        break;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -622,6 +632,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     wc.lpszClassName = WND_CLASS_OVERLAY;
     RegisterClassExW(&wc);
 
+    /* ── Register TaskbarCreated message (Explorer restart recovery) ── */
+    s_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+
     /* ── Tray icon ── */
     HICON hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP));
     if (!hIcon)
@@ -635,7 +648,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
     s_nid.uCallbackMessage = WM_TRAY_MSG;
     s_nid.hIcon            = hIcon;
     lstrcpyW(s_nid.szTip, L"MyToolKit");
-    Shell_NotifyIconW(NIM_ADD, &s_nid);
+
+    /* 开机自启时 Explorer 可能尚未就绪，重试几次确保图标添加成功 */
+    for (int retry = 0; retry < 10; retry++)
+    {
+        if (Shell_NotifyIconW(NIM_ADD, &s_nid))
+            break;
+        Sleep(500);
+    }
 
     /* ── Keyboard hook (CapsRemap + EscClose) ── */
     s_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, OnKeyboardEvent, NULL, 0);
