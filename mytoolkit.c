@@ -9,7 +9,7 @@
  * Build (MSVC):    build_msvc.bat
  * Build (MinGW):   windres resource.rc -o resource.o
  *                  gcc -O2 -s -mwindows mytoolkit.c resource.o -o mytoolkit.exe
- *                       -luser32 -lshell32 -ladvapi32 -lgdi32
+ *                       -luser32 -lshell32 -ladvapi32 -lgdi32 -ldwmapi -lpsapi
  */
 
 #ifdef _MSC_VER
@@ -17,6 +17,8 @@
 #   pragma comment(lib, "shell32.lib")
 #   pragma comment(lib, "advapi32.lib")
 #   pragma comment(lib, "gdi32.lib")
+#   pragma comment(lib, "dwmapi.lib")
+#   pragma comment(lib, "psapi.lib")
 #   pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #endif
 
@@ -24,6 +26,8 @@
 #define NOMINMAX
 #include <windows.h>
 #include <shellapi.h>
+#include <dwmapi.h>
+#include <psapi.h>
 #include <stdlib.h>
 
 /* ── Message / timer IDs ── */
@@ -73,33 +77,7 @@ static BOOL            s_escDown;      /* ESC physically held      */
 static BOOL            s_escActive;    /* countdown phase running  */
 static int             s_escElapsedMs; /* ms elapsed in countdown  */
 static BOOL            s_capsDown;     /* CapsLock physically held */
-static BOOL            s_winBacktickDown; /* Win+` physically held */
-static BOOL            s_winBacktickConsumed; /* suppress Start on Win key-up */
 static UINT            s_wmTaskbarCreated; /* "TaskbarCreated" msg ID */
-
-static BOOL IsWinBacktickKey(const KBDLLHOOKSTRUCT* kb)
-{
-    if (kb->vkCode != VK_OEM_3) return FALSE;
-    return (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
-           (GetAsyncKeyState(VK_RWIN) & 0x8000);
-}
-
-static void MaskWinKeyMenuActivation(void)
-{
-    /* When the physical ` key is suppressed, Windows may treat Win as a lone
-     * press and open Start on key-up. Send an injected Shift tap while Win is
-     * still down so the shell observes a real combination instead.
-     * Do not use Ctrl here: Windows can be configured to show the mouse
-     * pointer location on Ctrl, which causes a distracting ring. */
-    INPUT seq[2];
-    ZeroMemory(seq, sizeof(seq));
-    seq[0].type       = INPUT_KEYBOARD;
-    seq[0].ki.wVk     = VK_SHIFT;
-    seq[1].type       = INPUT_KEYBOARD;
-    seq[1].ki.wVk     = VK_SHIFT;
-    seq[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, seq, sizeof(INPUT));
-}
 
 
 /* ════════════════════════════════════════════════════════════════
@@ -114,35 +92,6 @@ static LRESULT CALLBACK OnKeyboardEvent(int code, WPARAM wParam, LPARAM lParam)
 
         if (!(kb->flags & LLKHF_INJECTED))
         {
-            if (kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN)
-            {
-                if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) && s_winBacktickConsumed)
-                {
-                    s_winBacktickConsumed = FALSE;
-                    s_winBacktickDown = FALSE;
-                    return 1; /* prevent shell from treating Win as a lone tap */
-                }
-            }
-
-            if (IsWinBacktickKey(kb))
-            {
-                if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
-                {
-                    if (!s_winBacktickDown)
-                    {
-                        s_winBacktickDown = TRUE;
-                        s_winBacktickConsumed = TRUE;
-                        MaskWinKeyMenuActivation();
-                        PostMessageW(s_hwndMain, WM_HOTKEY, HOTKEY_WIN_BACKTICK, 0);
-                    }
-                }
-                else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
-                {
-                    s_winBacktickDown = FALSE;
-                }
-                return 1; /* fallback if RegisterHotKey fails; also prevents literal ` input */
-            }
-
             /* ── CapsRemap / CapsToggle ──
              *   Tap  (<400ms): Ctrl+Space  (input method switch)
              *   Hold (>=400ms): real CapsLock toggle (macOS style)
@@ -422,35 +371,98 @@ static void ToggleStartup(void)
 
 
 /* ════════════════════════════════════════════════════════════════
- *  Feature 3: WinBacktick — Win+` cycles windows of the same app
- *  Enumerates all visible top-level windows belonging to the same
- *  process as the foreground window, then activates the next one.
+ *  Feature 3: WinBacktick — Win+` cycles windows of the same app.
+ *
+ *  Design rule: RegisterHotKey is the only owner of Win+`. The low-level
+ *  keyboard hook must not suppress any part of this chord. Suppressing ` or Win
+ *  forces us to fake key-up/key-down state with SendInput, which races with the
+ *  shell and causes Start menu popups, stuck logical Win, or missed switches.
+ *
+ *  "Same app" is matched by executable path instead of PID so multi-process
+ *  apps such as Chrome, VS Code, Windows Terminal, and Electron apps still cycle
+ *  together.
  * ════════════════════════════════════════════════════════════════ */
 typedef struct {
-    DWORD  pid;
+    WCHAR  exePath[MAX_PATH];
     HWND*  list;
     int    count;
     int    capacity;
     BOOL   failed;
 } EnumSameAppCtx;
 
+static HWND GetRootAppWindow(HWND hwnd)
+{
+    HWND root = hwnd ? GetAncestor(hwnd, GA_ROOT) : NULL;
+    return root ? root : hwnd;
+}
+
+static BOOL GetWindowExePath(HWND hwnd, WCHAR* exePath, DWORD cchExePath)
+{
+    DWORD pid = 0;
+    HANDLE process;
+    DWORD size = cchExePath;
+
+    exePath[0] = L'\0';
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (!pid) return FALSE;
+
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (process)
+    {
+        if (QueryFullProcessImageNameW(process, 0, exePath, &size))
+        {
+            CloseHandle(process);
+            return TRUE;
+        }
+        CloseHandle(process);
+    }
+
+    process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (!process) return FALSE;
+    if (!GetModuleFileNameExW(process, NULL, exePath, cchExePath))
+    {
+        CloseHandle(process);
+        exePath[0] = L'\0';
+        return FALSE;
+    }
+    CloseHandle(process);
+    return TRUE;
+}
+
+static BOOL IsSwitchableWindow(HWND hwnd)
+{
+    LONG style;
+    LONG exStyle;
+    HWND owner;
+    BOOL cloaked = FALSE;
+
+    if (!IsWindowVisible(hwnd)) return FALSE;
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return FALSE;
+
+    style = GetWindowLongW(hwnd, GWL_STYLE);
+    exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
+    if (style & WS_CHILD) return FALSE;
+    if (exStyle & WS_EX_TOOLWINDOW) return FALSE;
+    if (GetWindowTextLengthW(hwnd) == 0) return FALSE;
+
+    owner = GetWindow(hwnd, GW_OWNER);
+    if (owner && !(exStyle & WS_EX_APPWINDOW)) return FALSE;
+
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+        return FALSE;
+
+    return TRUE;
+}
+
 static BOOL CALLBACK EnumSameAppProc(HWND hwnd, LPARAM lParam)
 {
     EnumSameAppCtx* ctx = (EnumSameAppCtx*)lParam;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
+    WCHAR exePath[MAX_PATH];
+
     if (ctx->failed) return FALSE;
-    if (pid != ctx->pid) return TRUE;
-
-    /* Only consider visible, non-minimized, non-tool, non-child top-level windows */
-    if (!IsWindowVisible(hwnd)) return TRUE;
-    LONG exStyle = GetWindowLongW(hwnd, GWL_EXSTYLE);
-    if (exStyle & WS_EX_TOOLWINDOW) return TRUE;
-    LONG style = GetWindowLongW(hwnd, GWL_STYLE);
-    if (style & WS_CHILD) return TRUE;
-
-    /* Must have a non-empty title (filters out hidden helper windows) */
-    if (GetWindowTextLengthW(hwnd) == 0) return TRUE;
+    if (!IsSwitchableWindow(hwnd)) return TRUE;
+    if (!GetWindowExePath(hwnd, exePath, MAX_PATH)) return TRUE;
+    if (lstrcmpiW(exePath, ctx->exePath) != 0) return TRUE;
 
     if (ctx->count >= ctx->capacity)
     {
@@ -468,22 +480,43 @@ static BOOL CALLBACK EnumSameAppProc(HWND hwnd, LPARAM lParam)
     return TRUE;
 }
 
+static void ActivateWindow(HWND hwnd)
+{
+    DWORD currentThread = GetCurrentThreadId();
+    DWORD targetThread = GetWindowThreadProcessId(hwnd, NULL);
+    HWND foreground = GetForegroundWindow();
+    DWORD foregroundThread = foreground ? GetWindowThreadProcessId(foreground, NULL) : 0;
+
+    if (IsIconic(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+
+    if (foregroundThread) AttachThreadInput(currentThread, foregroundThread, TRUE);
+    if (targetThread) AttachThreadInput(currentThread, targetThread, TRUE);
+
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+
+    if (targetThread) AttachThreadInput(currentThread, targetThread, FALSE);
+    if (foregroundThread) AttachThreadInput(currentThread, foregroundThread, FALSE);
+}
+
 static void SwitchToNextAppWindow(void)
 {
-    HWND fgWnd = GetForegroundWindow();
+    HWND fgWnd = GetRootAppWindow(GetForegroundWindow());
+    WCHAR exePath[MAX_PATH];
+    EnumSameAppCtx ctx;
+    int idx = -1;
+    HWND target;
+
     if (!fgWnd) return;
+    if (!GetWindowExePath(fgWnd, exePath, MAX_PATH)) return;
 
-    DWORD fgPid = 0;
-    GetWindowThreadProcessId(fgWnd, &fgPid);
-    if (!fgPid) return;
-
-    EnumSameAppCtx ctx = { fgPid, NULL, 0, 0, FALSE };
+    ZeroMemory(&ctx, sizeof(ctx));
+    lstrcpynW(ctx.exePath, exePath, MAX_PATH);
     EnumWindows(EnumSameAppProc, (LPARAM)&ctx);
 
     if (ctx.failed || ctx.count < 2) { free(ctx.list); return; }
 
-    /* Find current window in list and pick the next one */
-    int idx = -1;
     for (int i = 0; i < ctx.count; i++)
     {
         if (ctx.list[i] == fgWnd) { idx = i; break; }
@@ -491,11 +524,8 @@ static void SwitchToNextAppWindow(void)
 
     if (idx < 0) { free(ctx.list); return; }
 
-    HWND target = ctx.list[(idx + 1) % ctx.count];
-
-    /* Activate the target window */
-    if (IsIconic(target)) ShowWindow(target, SW_RESTORE);
-    SetForegroundWindow(target);
+    target = ctx.list[(idx + 1) % ctx.count];
+    ActivateWindow(target);
 
     free(ctx.list);
 }
