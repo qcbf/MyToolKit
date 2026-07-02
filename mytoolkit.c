@@ -74,6 +74,7 @@ static BOOL            s_escActive;    /* countdown phase running  */
 static int             s_escElapsedMs; /* ms elapsed in countdown  */
 static BOOL            s_capsDown;     /* CapsLock physically held */
 static BOOL            s_winBacktickDown; /* Win+` physically held */
+static BOOL            s_winBacktickConsumed; /* suppress Start on Win key-up */
 static UINT            s_wmTaskbarCreated; /* "TaskbarCreated" msg ID */
 
 static BOOL IsWinBacktickKey(const KBDLLHOOKSTRUCT* kb)
@@ -113,6 +114,16 @@ static LRESULT CALLBACK OnKeyboardEvent(int code, WPARAM wParam, LPARAM lParam)
 
         if (!(kb->flags & LLKHF_INJECTED))
         {
+            if (kb->vkCode == VK_LWIN || kb->vkCode == VK_RWIN)
+            {
+                if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) && s_winBacktickConsumed)
+                {
+                    s_winBacktickConsumed = FALSE;
+                    s_winBacktickDown = FALSE;
+                    return 1; /* prevent shell from treating Win as a lone tap */
+                }
+            }
+
             if (IsWinBacktickKey(kb))
             {
                 if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
@@ -120,6 +131,7 @@ static LRESULT CALLBACK OnKeyboardEvent(int code, WPARAM wParam, LPARAM lParam)
                     if (!s_winBacktickDown)
                     {
                         s_winBacktickDown = TRUE;
+                        s_winBacktickConsumed = TRUE;
                         MaskWinKeyMenuActivation();
                         PostMessageW(s_hwndMain, WM_HOTKEY, HOTKEY_WIN_BACKTICK, 0);
                     }
