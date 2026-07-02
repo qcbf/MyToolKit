@@ -73,7 +73,32 @@ static BOOL            s_escDown;      /* ESC physically held      */
 static BOOL            s_escActive;    /* countdown phase running  */
 static int             s_escElapsedMs; /* ms elapsed in countdown  */
 static BOOL            s_capsDown;     /* CapsLock physically held */
+static BOOL            s_winBacktickDown; /* Win+` physically held */
 static UINT            s_wmTaskbarCreated; /* "TaskbarCreated" msg ID */
+
+static BOOL IsWinBacktickKey(const KBDLLHOOKSTRUCT* kb)
+{
+    if (kb->vkCode != VK_OEM_3) return FALSE;
+    return (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
+           (GetAsyncKeyState(VK_RWIN) & 0x8000);
+}
+
+static void MaskWinKeyMenuActivation(void)
+{
+    /* When the physical ` key is suppressed, Windows may treat Win as a lone
+     * press and open Start on key-up. Send an injected Shift tap while Win is
+     * still down so the shell observes a real combination instead.
+     * Do not use Ctrl here: Windows can be configured to show the mouse
+     * pointer location on Ctrl, which causes a distracting ring. */
+    INPUT seq[2];
+    ZeroMemory(seq, sizeof(seq));
+    seq[0].type       = INPUT_KEYBOARD;
+    seq[0].ki.wVk     = VK_SHIFT;
+    seq[1].type       = INPUT_KEYBOARD;
+    seq[1].ki.wVk     = VK_SHIFT;
+    seq[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(2, seq, sizeof(INPUT));
+}
 
 
 /* ════════════════════════════════════════════════════════════════
@@ -88,6 +113,24 @@ static LRESULT CALLBACK OnKeyboardEvent(int code, WPARAM wParam, LPARAM lParam)
 
         if (!(kb->flags & LLKHF_INJECTED))
         {
+            if (IsWinBacktickKey(kb))
+            {
+                if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)
+                {
+                    if (!s_winBacktickDown)
+                    {
+                        s_winBacktickDown = TRUE;
+                        MaskWinKeyMenuActivation();
+                        PostMessageW(s_hwndMain, WM_HOTKEY, HOTKEY_WIN_BACKTICK, 0);
+                    }
+                }
+                else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP)
+                {
+                    s_winBacktickDown = FALSE;
+                }
+                return 1; /* fallback if RegisterHotKey fails; also prevents literal ` input */
+            }
+
             /* ── CapsRemap / CapsToggle ──
              *   Tap  (<400ms): Ctrl+Space  (input method switch)
              *   Hold (>=400ms): real CapsLock toggle (macOS style)
@@ -152,6 +195,13 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         /* Double-buffer */
         HDC     memDC  = CreateCompatibleDC(hdc);
         HBITMAP memBmp = CreateCompatibleBitmap(hdc, OV_W, OV_H);
+        if (!memDC || !memBmp)
+        {
+            if (memBmp) DeleteObject(memBmp);
+            if (memDC) DeleteDC(memDC);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
         HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
         /* Background */
@@ -222,7 +272,7 @@ static void ShowEscOverlay(void)
     HMONITOR hMon = MonitorFromWindow(hFg ? hFg : s_hwndMain, MONITOR_DEFAULTTONEAREST);
     MONITORINFO mi;
     mi.cbSize = sizeof(mi);
-    GetMonitorInfo(hMon, &mi);
+    if (!GetMonitorInfo(hMon, &mi)) return;
     int x = mi.rcMonitor.left + (mi.rcMonitor.right  - mi.rcMonitor.left - OV_W) / 2;
     int y = mi.rcMonitor.top  + (mi.rcMonitor.bottom - mi.rcMonitor.top  - OV_H) / 2;
 
@@ -369,6 +419,7 @@ typedef struct {
     HWND*  list;
     int    count;
     int    capacity;
+    BOOL   failed;
 } EnumSameAppCtx;
 
 static BOOL CALLBACK EnumSameAppProc(HWND hwnd, LPARAM lParam)
@@ -376,6 +427,7 @@ static BOOL CALLBACK EnumSameAppProc(HWND hwnd, LPARAM lParam)
     EnumSameAppCtx* ctx = (EnumSameAppCtx*)lParam;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
+    if (ctx->failed) return FALSE;
     if (pid != ctx->pid) return TRUE;
 
     /* Only consider visible, non-minimized, non-tool, non-child top-level windows */
@@ -390,8 +442,15 @@ static BOOL CALLBACK EnumSameAppProc(HWND hwnd, LPARAM lParam)
 
     if (ctx->count >= ctx->capacity)
     {
-        ctx->capacity = ctx->capacity ? ctx->capacity * 2 : 16;
-        ctx->list = (HWND*)realloc(ctx->list, ctx->capacity * sizeof(HWND));
+        int newCapacity = ctx->capacity ? ctx->capacity * 2 : 16;
+        HWND* newList = (HWND*)realloc(ctx->list, newCapacity * sizeof(HWND));
+        if (!newList)
+        {
+            ctx->failed = TRUE;
+            return FALSE;
+        }
+        ctx->list = newList;
+        ctx->capacity = newCapacity;
     }
     ctx->list[ctx->count++] = hwnd;
     return TRUE;
@@ -406,10 +465,10 @@ static void SwitchToNextAppWindow(void)
     GetWindowThreadProcessId(fgWnd, &fgPid);
     if (!fgPid) return;
 
-    EnumSameAppCtx ctx = { fgPid, NULL, 0, 0 };
+    EnumSameAppCtx ctx = { fgPid, NULL, 0, 0, FALSE };
     EnumWindows(EnumSameAppProc, (LPARAM)&ctx);
 
-    if (ctx.count < 2) { free(ctx.list); return; }
+    if (ctx.failed || ctx.count < 2) { free(ctx.list); return; }
 
     /* Find current window in list and pick the next one */
     int idx = -1;
@@ -417,6 +476,8 @@ static void SwitchToNextAppWindow(void)
     {
         if (ctx.list[i] == fgWnd) { idx = i; break; }
     }
+
+    if (idx < 0) { free(ctx.list); return; }
 
     HWND target = ctx.list[(idx + 1) % ctx.count];
 
@@ -522,6 +583,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_TIMER:
         if (wParam == TIMER_CAPS)
         {
+            KillTimer(hwnd, TIMER_CAPS);
+
             /* Long press threshold reached → toggle real CapsLock.
              * Send injected VK_CAPITAL so it bypasses our hook filter
              * and reaches the system (toggles LED + caps state).      */
@@ -659,6 +722,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
 
     /* ── Keyboard hook (CapsRemap + EscClose) ── */
     s_kbHook = SetWindowsHookExW(WH_KEYBOARD_LL, OnKeyboardEvent, NULL, 0);
+    if (!s_kbHook)
+        MessageBoxW(NULL, L"键盘钩子安装失败，CapsLock/ESC/Win+` 功能可能不可用。", TASK_NAME, MB_OK | MB_ICONERROR);
 
     /* ── Win+` hotkey (WinBacktick: cycle same-app windows) ── */
     RegisterHotKey(s_hwndMain, HOTKEY_WIN_BACKTICK, MOD_WIN | MOD_NOREPEAT, VK_OEM_3);
