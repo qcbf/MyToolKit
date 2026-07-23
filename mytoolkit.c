@@ -42,6 +42,7 @@
 #define TIMER_ESC_DELAY      1    /* 200ms one-shot: ignores short taps        */
 #define TIMER_ESC_TICK       2    /* 30ms recurring: drives progress animation */
 #define TIMER_CAPS           3    /* one-shot: CapsLock long-press threshold   */
+#define TIMER_HOTKEY_RETRY   4    /* recurring: recover Win+` registration     */
 
 #define HOTKEY_WIN_BACKTICK  1    /* RegisterHotKey ID for Win+`               */
 
@@ -49,6 +50,7 @@
 #define ESC_HOLD_MS          1000 /* ms of hold required to fire Alt+F4        */
 #define ESC_TICK_MS          30   /* repaint interval (ms)                     */
 #define CAPS_HOLD_MS         400  /* ms to distinguish tap vs. long-press      */
+#define HOTKEY_RETRY_MS      5000 /* retry registration after a conflict        */
 
 /* ── Overlay geometry ── */
 #define OV_W                 260
@@ -77,6 +79,7 @@ static BOOL            s_escDown;      /* ESC physically held      */
 static BOOL            s_escActive;    /* countdown phase running  */
 static int             s_escElapsedMs; /* ms elapsed in countdown  */
 static BOOL            s_capsDown;     /* CapsLock physically held */
+static BOOL            s_winBacktickRegistered;
 static UINT            s_wmTaskbarCreated; /* "TaskbarCreated" msg ID */
 
 
@@ -530,6 +533,17 @@ static void SwitchToNextAppWindow(void)
     free(ctx.list);
 }
 
+static void RegisterWinBacktickHotkey(HWND hwnd)
+{
+    s_winBacktickRegistered = RegisterHotKey(
+        hwnd, HOTKEY_WIN_BACKTICK, MOD_WIN | MOD_NOREPEAT, VK_OEM_3);
+
+    if (s_winBacktickRegistered)
+        KillTimer(hwnd, TIMER_HOTKEY_RETRY);
+    else
+        SetTimer(hwnd, TIMER_HOTKEY_RETRY, HOTKEY_RETRY_MS, NULL);
+}
+
 
 /* ════════════════════════════════════════════════════════════════
  *  Tray icon & context menu
@@ -678,6 +692,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 InvalidateRect(s_hwndOverlay, NULL, FALSE);
             }
         }
+        else if (wParam == TIMER_HOTKEY_RETRY)
+        {
+            RegisterWinBacktickHotkey(hwnd);
+        }
         return 0;
 
     case WM_DESTROY:
@@ -685,6 +703,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         KillTimer(hwnd, TIMER_CAPS);
         KillTimer(hwnd, TIMER_ESC_DELAY);
         KillTimer(hwnd, TIMER_ESC_TICK);
+        KillTimer(hwnd, TIMER_HOTKEY_RETRY);
         HideEscOverlay();
         Shell_NotifyIconW(NIM_DELETE, &s_nid);
         PostQuitMessage(0);
@@ -768,7 +787,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow)
         MessageBoxW(NULL, L"键盘钩子安装失败，CapsLock/ESC/Win+` 功能可能不可用。", TASK_NAME, MB_OK | MB_ICONERROR);
 
     /* ── Win+` hotkey (WinBacktick: cycle same-app windows) ── */
-    RegisterHotKey(s_hwndMain, HOTKEY_WIN_BACKTICK, MOD_WIN | MOD_NOREPEAT, VK_OEM_3);
+    RegisterWinBacktickHotkey(s_hwndMain);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0)
     {
